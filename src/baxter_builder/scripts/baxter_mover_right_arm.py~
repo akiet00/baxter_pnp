@@ -1,0 +1,320 @@
+#!/usr/bin/env python
+
+import sys
+import copy
+import rospy
+import cv2
+import cv_bridge
+import moveit_commander
+import moveit_msgs.msg
+import geometry_msgs.msg
+import baxter_interface
+from baxter_interface import Gripper
+import numpy as np
+
+from std_msgs.msg import (
+    Header,
+    String,
+    Empty,
+    Int32,
+)
+from geometry_msgs.msg import (PoseStamped, Pose, Point, Quaternion)
+from baxter_core_msgs.msg import EndEffectorState
+
+from sensor_msgs.msg import Image
+from moveit_commander import MoveGroupCommander
+
+#from std_msgs.msg import Int32
+from geometry_msgs.msg import Pose, PoseStamped
+
+from baxter_core_msgs.srv import ( SolvePositionIK,
+                                   SolvePositionIKRequest )
+
+from baxter_builder.srv import *
+
+sleep_flag = True
+xpos = 0
+ypos = 0
+zpos = 0
+grip_force = 0
+
+def init():
+    #Wake up Baxter
+    baxter_interface.RobotEnable().enable()
+    rospy.sleep(0.25)
+    print "Baxter is enabled"
+
+    print "Intitializing clients for services"
+    global ik_service_left
+    ik_service_left = rospy.ServiceProxy(
+            "ExternalTools/left/PositionKinematicsNode/IKService",
+            SolvePositionIK)
+
+    global ik_service_right
+    ik_service_right = rospy.ServiceProxy(
+            "ExternalTools/right/PositionKinematicsNode/IKService",
+            SolvePositionIK)
+
+    global obj_loc_service
+    obj_loc_service = rospy.ServiceProxy(
+        "object_location_service", ObjLocation)
+
+    global stopflag
+    stopflag = False
+    #Taken from the MoveIt Tutorials
+    moveit_commander.roscpp_initialize(sys.argv)
+    robot = moveit_commander.RobotCommander()
+
+    global scene
+    scene = moveit_commander.PlanningSceneInterface()
+
+    #Activate right Arm to be used with MoveIt
+    global right_group
+    right_group = MoveGroupCommander("right_arm")
+    right_group.set_goal_position_tolerance(0.5) # i    ncrease from 0.01
+    right_group.set_goal_orientation_tolerance(0.5) #increase from 0.01
+
+    global left_group
+    left_group = MoveGroupCommander("left_arm")
+    pose_left = Pose()
+    pose_left.position = Point(0.7, 0.15, -0.129)
+    pose_left.orientation = Quaternion(
+                             x=-0.0249590815779,
+                             y=0.999649402929,
+                             z=0.00737916180073,
+                             w=0.00486450832011)
+
+    '''global right_group
+    right_group = MoveGroupCommander("right_arm")
+    pose_right = Pose()
+    pose_right.position = Point(0.793, -0.586, 0.329)
+    pose_right.orientation = Quaternion(1.0, 0.0, 0.0, 0.0)
+    request_pose(pose_right, "right", right_group)'''
+
+
+    global right_gripper
+    right_gripper = baxter_interface.Gripper('right')
+    right_gripper.calibrate()
+    print right_gripper.parameters()
+
+    global end_effector_subs
+    end_effector_subs = rospy.Subscriber("/robot/end_effector/right_gripper/state", EndEffectorState, end_effector_callback)
+    rospy.sleep(1)
+
+    global pubpic
+    pubpic = rospy.Publisher('/robot/xdisplay', Image, latch=True, queue_size=1)
+    rospy.sleep(1)
+
+def request_pose(pose, arm, groupl):
+    # Set stamped pose
+    pose_stamped = PoseStamped()
+    pose_stamped.header = Header(stamp=rospy.Time.now(), frame_id='base')
+    pose_stamped.pose = pose
+    print pose_stamped
+
+    # Create IK request
+    print "Requesting IK service"
+    ik_request = SolvePositionIKRequest()
+    ik_request.pose_stamp.append(pose_stamped)
+
+    arm_name_service = "ExternalTools/" + arm + "/PositionKinematicsNode/IKService"
+    
+    # Request service
+    try:
+        print "Waiting for IK response"
+        rospy.wait_for_service(arm_name_service, 5.0)
+        if arm == "right":
+            resp = ik_service_right(ik_request) # right_arm
+        else:
+            resp = ik_service_left(ik_request) # left arm
+    except (rospy.ServiceException, rospy.ROSException), error_message:
+        rospy.logerr("Service request failed: %r" %(error_message))
+        sys.exit("ERROR - move_to_observe - Failed to append pose")
+
+    print "Response Message: \n", ik_response
+
+    # check if result is valid
+    resp_seeds = struct.unpack('<%dB' % len(resp.result_type), resp.result_type)
+        limb_joints = {}
+    '''if ik_response.isValid[0]:
+        limb_joints = dict(zip(ik_response.joints[0].name, ik_response.joints[0].position))
+        print "\nIK Joint Solution:\n", limb_joints
+        print "--------------------"
+
+
+        #Motion planning and the execution
+        groupl.set_start_state_to_current_state()
+        groupl.set_joint_value_target(limb_joints)
+        plan2= groupl.plan(limb_joints)
+        rospy.sleep(1.5)
+        groupl.execute(plan2) # Move to new pose
+        rospy.sleep(0.25)
+        return True
+    else:
+        print "INVALID POSE- No valid joint solution found."
+        return False'''
+
+def move_to_vision():
+    # Set pose
+    pose = Pose()
+    pose.orientation = Quaternion(1.00, 0.0, 0.00, 0.00)
+    #pose.position = Point(0.712, 0.316, 0.250)
+    pose.position = Point(0.75, 0.4, 0.20)
+    # Request service
+    request_pose(pose,"right", right_group)
+
+def end_effector_callback(msg):
+    global grip_force
+    grip_force = msg.force
+
+def move_to_box(objcolorl):
+    if objcolorl == 0:
+        #move to green box
+        pose = Pose()
+        pose.orientation = Quaternion(1.00, 0.0, 0.00, 0.00)
+        pose.position = Point(0.570, -0.176, 0.283)
+        path = '/home/josmiranda/bt_ws/src/baxter_builder/images/green_success.png'
+        img = cv2.imread(path)
+
+        msg = cv_bridge.CvBridge().cv2_to_imgmsg(img, encoding="bgr8")
+        pubpic.publish(msg)
+    else:
+        #move to blue box
+        pose = Pose()
+        pose.orientation = Quaternion(1.00, 0.0, 0.00, 0.00)
+        pose.position = Point(0.708, -0.153, 0.258)
+        path = '/home/josmiranda/bt_ws/src/baxter_builder/images/red_success.png'
+        img = cv2.imread(path)
+        msg = cv_bridge.CvBridge().cv2_to_imgmsg(img, encoding="bgr8")
+        pubpic.publish(msg)
+    request_pose(pose, "right", right_group)
+
+
+def move_to_object(xposl, yposl, zposl, objcolorl):
+    global grip_force
+    pose = Pose()
+    pose.position = Point(xposl-0.01, yposl, 0.00)
+    pose.orientation = Quaternion(1.00, 0.0, 0.00, 0.00)
+
+
+    request_pose(pose, "right", right_group)
+    rospy.sleep(0.5)
+
+    # Get right hand range state
+    dist = baxter_interface.analog_io.AnalogIO('right_hand_range').state()
+    rospy.sleep(1)
+    if dist > 65000:
+        print "Out of Range"
+        truez = -0.13
+    else:
+        print "DISTANCE %f" % dist
+        truez = dist/1000
+        truez = truez - 0.06
+        truez = - (truez)
+        print truez
+
+
+    poset = Pose()
+    poset.position = Point(xposl, yposl, truez)
+    poset.orientation = Quaternion(1.00, 0.0, 0.00, 0.00)
+    request_pose(poset, "right", right_group)
+
+    right_gripper.close()
+    rospy.sleep(0.5)
+    if grip_force == 0:
+        right_gripper.open()
+        move_to_vision()
+    else:
+        pose = Pose()
+        pose.position = Point(xposl-0.01, yposl+0.01, 0.150)
+        pose.orientation = Quaternion(1.00, 0.0, 0.00, 0.00)
+        request_pose(pose, "right", right_group)
+        if grip_force == 0:
+            right_gripper.open()
+            move_to_vision()
+            return
+        move_to_box(objcolorl)
+        right_gripper.open()
+        move_to_vision()
+
+'''For Gazebo simulation'''
+def load_gazebo_models(table_pose=Pose(position=Point(x=1.0, y=0.0, z=0.0)),
+                       table_reference_frame="world",
+                       block_pose=Pose(position=Point(x=0.6725, y=0.1265, z=0.7825)),
+                       block_reference_frame="world"):
+    # Get Models' Path
+    model_path = rospkg.RosPack().get_path('baxter_builder')+"/models/"
+    # Load Table SDF
+    table_xml = ''
+    with open (model_path + "cafe_table/model.sdf", "r") as table_file:
+        table_xml=table_file.read().replace('\n', '')
+    # Load Block URDF
+    block_xml = ''
+    with open (model_path + "block/model.urdf", "r") as block_file:
+        block_xml=block_file.read().replace('\n', '')
+    # Spawn Table SDF
+    rospy.wait_for_service('/gazebo/spawn_sdf_model')
+    try:
+        spawn_sdf = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
+        resp_sdf = spawn_sdf("cafe_table", table_xml, "/",
+                             table_pose, table_reference_frame)
+    except rospy.ServiceException, e:
+        rospy.logerr("Spawn SDF service call failed: {0}".format(e))
+    # Spawn Block URDF
+    rospy.wait_for_service('/gazebo/spawn_urdf_model')
+    try:
+        spawn_urdf = rospy.ServiceProxy('/gazebo/spawn_urdf_model', SpawnModel)
+        resp_urdf = spawn_urdf("block", block_xml, "/",
+                               block_pose, block_reference_frame)
+    except rospy.ServiceException, e:
+        rospy.logerr("Spawn URDF service call failed: {0}".format(e))
+
+def delete_gazebo_models():
+    # This will be called on ROS Exit, deleting Gazebo models
+    # Do not wait for the Gazebo Delete Model service, since
+    # Gazebo should already be running. If the service is not
+    # available since Gazebo has been killed, it is fine to error out
+    try:
+        delete_model = rospy.ServiceProxy('/gazebo/delete_model', DeleteModel)
+        resp_delete = delete_model("cafe_table")
+        resp_delete = delete_model("block")
+    except rospy.ServiceException, e:
+        rospy.loginfo("Delete Model service call failed: {0}".format(e))
+'''End section for Gazebo'''
+
+def main():
+    rospy.init_node('baxter_right_arm_mover_node')
+    print "Initializing all MoveIt related functions and services"
+    init()
+
+    rospy.loginfo(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> \n Initilizing Gazebo")
+    #load_gazebo_models()
+
+    # delete all Gazebo models on Exit
+    #rospy.on_shutdown(delete_gazebo_models)
+
+    # Wait for all clear from gazebo
+
+    #rospy.wait_for_message("/robot/sim/started", Empty)
+
+    print "Move to Vision Pose"
+    move_to_vision()
+    rospy.sleep(15)
+    print "In the loop"
+    while not rospy.is_shutdown():
+        try:
+            rospy.wait_for_service('object_location_service')
+            response = obj_loc_service.call(ObjLocationRequest())
+            print "Response from Location Service"
+            print response
+            #if response.objfound == True:
+            if response.objfound:
+                move_to_object(response.xb, response.yb, response.zb, response.objcolor)
+            else:
+                #Move to random pose
+                print "Moving to random pose"
+        except rospy.ServiceException, e:
+            print "Service call failed: %s" % e
+
+if __name__ == '__main__':
+    main()
